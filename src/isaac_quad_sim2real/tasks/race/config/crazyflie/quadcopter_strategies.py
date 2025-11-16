@@ -242,6 +242,34 @@ class DefaultQuadcopterStrategy:
             extras = dict()
             extras["Episode_Termination/died"] = torch.count_nonzero(self.env.reset_terminated[env_ids]).item()
             extras["Episode_Termination/time_out"] = torch.count_nonzero(self.env.reset_time_outs[env_ids]).item()
+            
+            # ============ 竞赛指标：20秒跑3圈 ============
+            # 计算完成的圈数
+            n_laps_completed = self.env._n_gates_passed[env_ids].float() / 6.0  # 6个门 = 1圈
+            avg_laps = torch.mean(n_laps_completed)
+            extras["Race_Metrics/laps_completed"] = avg_laps.item()
+            
+            # 计算episode用时（秒）
+            episode_time_s = self.env.episode_length_buf[env_ids].float() * self.env.cfg.sim.dt * self.env.cfg.decimation
+            avg_episode_time_s = torch.mean(episode_time_s)
+            extras["Race_Metrics/episode_time_seconds"] = avg_episode_time_s.item()
+            
+            # 计算每圈用时（只统计至少完成1圈的）
+            completed_at_least_one = n_laps_completed >= 1.0
+            if torch.any(completed_at_least_one):
+                time_per_lap = episode_time_s[completed_at_least_one] / n_laps_completed[completed_at_least_one]
+                avg_time_per_lap = torch.mean(time_per_lap)
+                extras["Race_Metrics/seconds_per_lap"] = avg_time_per_lap.item()
+            else:
+                extras["Race_Metrics/seconds_per_lap"] = 0.0  # 没完成1圈时显示0
+            
+            # 计算如果完成3圈需要多少时间（预估）
+            if avg_laps > 0:
+                estimated_3lap_time = (avg_episode_time_s / avg_laps) * 3.0
+                extras["Race_Metrics/estimated_3lap_time"] = estimated_3lap_time
+            else:
+                extras["Race_Metrics/estimated_3lap_time"] = 0.0
+            
             self.env.extras["log"].update(extras)
 
         # Call robot reset first
