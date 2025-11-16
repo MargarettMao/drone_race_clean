@@ -32,7 +32,7 @@ class PPO:
         learning_rate=1e-3,
         max_grad_norm=1.0,
         use_clipped_value_loss=True,
-        schedule="fixed",
+        schedule="adaptive",
         desired_kl=0.01,
         device="cpu",
         normalize_advantage_per_mini_batch=False,
@@ -146,9 +146,83 @@ class PPO:
             episode_masks,
             _,  # rnd_state_batch - not used anymore
         ) in generator:
-            # TODO ----- START -----
-            # Implement the PPO update step
-            # TODO ----- END -----
+        
+            # Normalize advantages per mini-batch if enabled
+            if self.normalize_advantage_per_mini_batch:
+                with torch.no_grad():
+                    advantage_estimates = (advantage_estimates - advantage_estimates.mean()) / (advantage_estimates.std() + 1e-8)
+            
+            # Evaluate current policy
+            if self.actor_critic.is_recurrent:
+                actions_log_prob = self.actor_critic.get_actions_log_prob(sampled_actions)
+                value = self.actor_critic.evaluate(critic_observations, masks=episode_masks, hidden_states=hidden_states)
+                entropy = self.actor_critic.entropy
+            else:
+                self.actor_critic.act(observations)
+                actions_log_prob = self.actor_critic.get_actions_log_prob(sampled_actions)
+                value = self.actor_critic.evaluate(critic_observations)
+                entropy = self.actor_critic.entropy
+            
+            # Adaptive Learning Rate
+            # Get current policy parameters for KL computation
+            current_mean = self.actor_critic.action_mean
+            current_std = self.actor_critic.action_std
+            # Compute KL divergence and adapt learning rate
+            if self.desired_kl is not None and self.schedule == "adaptive":
+                with torch.inference_mode():
+                    kl = torch.sum(
+                        torch.log(current_std / prev_action_stds + 1.0e-5)
+                        + (torch.square(prev_action_stds) + torch.square(prev_mean_actions - current_mean))
+                        / (2.0 * torch.square(current_std))
+                        - 0.5,
+                        axis=-1,
+                    )
+                    kl_mean = torch.mean(kl)
+                    
+                    # Adjust learning rate based on KL divergence
+                    if kl_mean > self.desired_kl * 2.0:
+                        self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                    elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
+                        self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+                    
+                    # Update optimizer with new learning rate
+                    for param_group in self.optimizer.param_groups:
+                        param_group["lr"] = self.learning_rate
+            
+            # Compute surrogate loss (policy loss)
+            ratio = torch.exp(actions_log_prob - torch.squeeze(prev_log_probs))
+            surrogate = -torch.squeeze(advantage_estimates) * ratio
+            surrogate_clipped = -torch.squeeze(advantage_estimates) * torch.clamp(
+                ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
+            )
+            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+            
+            # Compute value function loss
+            if self.use_clipped_value_loss:
+                value_clipped = torch.squeeze(value_targets) + torch.clamp(
+                    torch.squeeze(value) - torch.squeeze(value_targets),
+                    -self.clip_param,
+                    self.clip_param,
+                )
+                value_loss_clipped = (value_clipped - torch.squeeze(discounted_returns)).pow(2)
+                value_loss_original = (torch.squeeze(value) - torch.squeeze(discounted_returns)).pow(2)
+                value_loss = torch.max(value_loss_original, value_loss_clipped).mean()
+            else:
+                value_loss = (torch.squeeze(discounted_returns) - torch.squeeze(value)).pow(2).mean()
+            
+            # Compute total loss
+            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
+            
+            # Gradient descent step
+            self.optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
+            self.optimizer.step()
+            
+            # Accumulate losses for logging
+            mean_value_loss += value_loss.item()
+            mean_surrogate_loss += surrogate_loss.item()
+            mean_entropy += entropy.mean().item()
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
