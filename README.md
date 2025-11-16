@@ -18,8 +18,9 @@ In order to train, we can call the following command from terminal:
 python scripts/rsl_rl/train_race.py \
     --task Isaac-Quadcopter-Race-v0 \
     --num_envs 8192 \
-    --max_iterations 5000 \
-    --headless
+    --max_iterations 3000 \
+    --headless \
+    --logger wandb 
 ```
 
 ## Evaluation
@@ -30,7 +31,7 @@ In order to play, we can call the following example command from terminal:
 python scripts/rsl_rl/play_race.py \
     --task Isaac-Quadcopter-Race-v0 \
     --num_envs 1 \
-    --load_run [YYYY-MM-DD_XX-XX-XX] \  # The run directory is in logs/rsl_rl/quadcopter_direct/
+    --load_run [YYYY-MM-DD_XX-XX-XX] \
     --checkpoint best_model.pt \
     --headless \
     --video \
