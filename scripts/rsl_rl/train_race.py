@@ -112,17 +112,32 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         log_dir += f"_{agent_cfg.run_name}"
     log_dir = os.path.join(log_root_path, log_dir)
 
-    # TODO ----- START ----- Define rewards scales
-    # reward scales
-    progress_goal_reward_scale = 50.0  # Reward for making progress toward gates
-    gate_passed_reward_scale = 10.0    # Bonus reward for passing through a gate
-    crash_reward_scale = -1.0          # Penalty for crashing
-    time_reward_scale = -0.01          # Small penalty per timestep to encourage speed
-    death_cost = -10.0                 # Large penalty for dying (going out of bounds, etc.)
+    # TODO ----- START ----- Define rewards scales (按照建议设置)
+    # ============ 奖励权重设计 ============
+    # 1. Progress: 减小到目标距离的密集奖励
+    progress_goal_reward_scale = 20.0
+    
+    # 2. Gate passing: 通过门的大奖励
+    gate_passed_reward_scale = 400.0
+    
+    # 3. Look-at-next-gate: 面向下一个门的小奖励
+    look_at_gate_reward_scale = 0.1
+    
+    # 4. Angular velocity penalty: 过度旋转的小惩罚
+    angular_penalty_reward_scale = -0.0001
+    
+    # 5. Termination penalty: episode终止的大惩罚
+    death_cost = -500.0
+    
+    # 6. 额外的奖励（可选调整）
+    crash_reward_scale = -1.0          # 碰撞惩罚
+    time_reward_scale = -0.01          # 时间惩罚（鼓励速度）
 
     rewards = {
         'progress_goal_reward_scale': progress_goal_reward_scale,
         'gate_passed_reward_scale': gate_passed_reward_scale,
+        'look_at_gate_reward_scale': look_at_gate_reward_scale,
+        'angular_penalty_reward_scale': angular_penalty_reward_scale,
         'crash_reward_scale': crash_reward_scale,
         'time_reward_scale': time_reward_scale,
         'death_cost': death_cost,

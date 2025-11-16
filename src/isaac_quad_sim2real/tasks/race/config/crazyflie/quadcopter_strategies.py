@@ -37,8 +37,6 @@ class DefaultQuadcopterStrategy:
         # Initialize episode sums for logging if in training mode
         if self.cfg.is_train and hasattr(env, 'rew'):
             keys = [key.split("_reward_scale")[0] for key in env.rew.keys() if key != "death_cost"]
-            # Add additional reward components that are not in env.rew
-            keys.extend(['gate_passed', 'time'])  # Add gate_passed and time reward components
             self._episode_sums = {
                 key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
                 for key in keys
@@ -110,15 +108,34 @@ class DefaultQuadcopterStrategy:
         crashed = (torch.norm(contact_forces, dim=-1) > 1e-8).squeeze(1).int()
         mask = (self.env.episode_length_buf > 100).int()
         self.env._crashed = self.env._crashed + crashed * mask
+        
+        # ============ 新增奖励组件（按照建议） ============
+        
+        # 3. Look-at-next-gate reward: 奖励无人机朝向目标门
+        # 计算无人机朝向和目标门方向的夹角
+        drone_forward = matrix_from_quat(self.env._robot.data.root_quat_w)[:, :3, 0]  # 无人机前向向量
+        gate_direction = self.env._desired_pos_w - self.env._robot.data.root_link_pos_w
+        gate_direction_norm = gate_direction / (torch.linalg.norm(gate_direction, dim=1, keepdim=True) + 1e-6)
+        
+        # 计算方向相似度（点积）：1表示完全对齐，-1表示相反
+        alignment = torch.sum(drone_forward * gate_direction_norm, dim=1)
+        look_at_gate = torch.clamp(alignment, 0.0, 1.0)  # 只奖励正向，不惩罚背向
+        
+        # 4. Angular velocity penalty: 惩罚过度旋转
+        ang_vel_magnitude = torch.linalg.norm(self.env._robot.data.root_ang_vel_b, dim=1)
+        angular_penalty = ang_vel_magnitude
+        
         # TODO ----- END -----
 
         # Compute rewards - training and testing use the same reward function
         # First create dictionary of raw rewards (without scales)
         raw_rewards = {
-            "progress_goal": progress_diff,  # Raw progress_diff (without scale)
-            "gate_passed": gate_passed.float(),  # Raw gate_passed (0 or 1)
-            "crash": crashed.float(),  # Raw crash (0 or 1)
-            "time": torch.ones(self.num_envs, device=self.device),  # Raw time penalty (1.0 per timestep)
+            "progress_goal": progress_diff,           # Progress (20.0 in suggestion)
+            "gate_passed": gate_passed.float(),       # Gate passing (400.0 in suggestion)
+            "look_at_gate": look_at_gate,             # Look-at-next-gate (0.1 in suggestion)
+            "angular_penalty": angular_penalty,       # Angular velocity penalty (-0.0001 in suggestion)
+            "crash": crashed.float(),                 # Crash penalty (custom)
+            "time": torch.ones(self.num_envs, device=self.device),  # Time penalty (custom)
         }
         
         # Store raw reward information in environment
@@ -126,15 +143,18 @@ class DefaultQuadcopterStrategy:
         
         # Training mode: compute scaled rewards
         if self.cfg.is_train:
-            # Apply reward scales to get final reward
+            # Apply reward scales to get final reward (按照建议的值)
             rewards = {
-                "progress_goal": raw_rewards["progress_goal"] * self.env.rew['progress_goal_reward_scale'],
-                "gate_passed": raw_rewards["gate_passed"] * self.env.rew['gate_passed_reward_scale'],
-                "crash": raw_rewards["crash"] * self.env.rew['crash_reward_scale'],
-                "time": raw_rewards["time"] * self.env.rew['time_reward_scale'],
+                "progress_goal": raw_rewards["progress_goal"] * self.env.rew['progress_goal_reward_scale'],      # 20.0
+                "gate_passed": raw_rewards["gate_passed"] * self.env.rew['gate_passed_reward_scale'],            # 400.0
+                "look_at_gate": raw_rewards["look_at_gate"] * self.env.rew['look_at_gate_reward_scale'],         # 0.1
+                "angular_penalty": raw_rewards["angular_penalty"] * self.env.rew['angular_penalty_reward_scale'], # -0.0001
+                "crash": raw_rewards["crash"] * self.env.rew['crash_reward_scale'],                              # custom
+                "time": raw_rewards["time"] * self.env.rew['time_reward_scale'],                                 # custom
             }
             
             reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
+            # Termination penalty (-500.0 in suggestion)
             reward = torch.where(self.env.reset_terminated,
                                 torch.ones_like(reward) * self.env.rew['death_cost'], reward)
         else:
@@ -154,68 +174,46 @@ class DefaultQuadcopterStrategy:
         The following code is an example. You should delete it or heavily modify it once you begin the racing task."""
 
         # TODO ----- START ----- Define tensors for your observation space. Be careful with frame transformations
-        #### Basic drone states
+        # ============ 观测设计：20D total (按照建议) ============
+        
+        # 1. Position (3D): world frame
         drone_pose_w = self.env._robot.data.root_link_pos_w
-        drone_lin_vel_b = self.env._robot.data.root_com_lin_vel_b
+        
+        # 2. Attitude (4D): quaternion in world frame
         drone_quat_w = self.env._robot.data.root_quat_w
-
-        ##### Some example observations you may want to explore using
-        # Angular velocities (referred to as body rates) - Important for control!
-        drone_ang_vel_b = self.env._robot.data.root_ang_vel_b  # [roll_rate, pitch_rate, yaw_rate]
-
-        # Current target gate information
+        
+        # 3. Linear velocity (3D): body frame
+        drone_lin_vel_b = self.env._robot.data.root_com_lin_vel_b
+        
+        # 4. Angular velocity (3D): body frame
+        drone_ang_vel_b = self.env._robot.data.root_ang_vel_b
+        
+        # 5. Target position (3D): next gate position in body frame
+        # 获取当前目标门的世界坐标位置
         current_gate_idx = self.env._idx_wp
-        # One-hot encoding of current gate (helps policy know which gate it's targeting)
-        # one_hot_gate_idx = torch.zeros(self.num_envs, self.env._waypoints.shape[0], dtype=torch.float32, device=self.device)
-        # one_hot_gate_idx[torch.arange(self.num_envs), current_gate_idx] = 1.0
+        current_gate_pos_w = self.env._waypoints[current_gate_idx, :3]
         
-        # current_gate_pos_w = self.env._waypoints[current_gate_idx, :3]  # World position of current gate
-        # current_gate_yaw = self.env._waypoints[current_gate_idx, -1].unsqueeze(-1)    # Yaw orientation of current gate
+        # 转换到机体坐标系（body frame）
+        gate_pos_b, _ = subtract_frame_transforms(
+            self.env._robot.data.root_link_pos_w,
+            self.env._robot.data.root_quat_w,
+            current_gate_pos_w
+        )
         
-        # Next gate information for planning ahead
-        # next_gate_idx = (current_gate_idx + 1) % self.env._waypoints.shape[0]
-        # next_gate_pos_w = self.env._waypoints[next_gate_idx, :3]  # World position of next gate
-        # next_gate_yaw = self.env._waypoints[next_gate_idx, -1].unsqueeze(-1)    # Yaw orientation of next gate
-        
-        # Relative position to next gate in world frame
-        # drone_pos_w = self.env._robot.data.root_link_pos_w
-        # drone_pos_next_gate_w = next_gate_pos_w - drone_pos_w  # Vector from drone to next gate
-
-        # Relative position to current gate in gate frame (IMPORTANT!)
-        drone_pos_gate_frame = self.env._pose_drone_wrt_gate
-
-        # Relative position to current gate in body frame
-        # gate_pos_b, _ = subtract_frame_transforms(
-        #     self.env._robot.data.root_link_pos_w,
-        #     self.env._robot.data.root_quat_w,
-        #     current_gate_pos_w
-        # )
-
-        # Previous actions (helps with temporal smoothness)
-        # prev_actions = self.env._previous_actions  # Shape: (num_envs, 4)
-
-        # Number of gates passed
-        # gates_passed = self.env._n_gates_passed.unsqueeze(1).float()
+        # 6. Previous action (4D): motor commands
+        prev_actions = self.env._previous_actions
 
         # TODO ----- END -----
 
         obs = torch.cat(
             # TODO ----- START ----- List your observation tensors here to be concatenated together
             [
-                ### Basic drone states ###
-                drone_ang_vel_b,    # angular velocity in the body frame (3 dims) - critical for control
-                drone_pose_w,       # position in the world frame (3 dims)
-                drone_lin_vel_b,    # velocity in the body frame (3 dims)
-                drone_quat_w,       # quaternion in the world frame (4 dims)
-                ### Gate information ###
-                drone_pos_gate_frame,   # relative position to current gate in gate frame (3 dims)
-                # one_hot_gate_idx,    # one-hot encoded index of current gate (6 dims)
-                # current_gate_yaw,      # yaw orientation of current gate (1 dim)
-                ### For next gate planning ###
-                # drone_pos_next_gate_w,  # relative position to next gate in world frame (3 dims)
-                # next_gate_yaw,         # yaw orientation of next gate (1 dim)
-                ### For dynamics adaptation ###
-                # prev_actions,       # previous actions (4 dims)
+                drone_pose_w,       # Position (3D): world frame
+                drone_quat_w,       # Attitude (4D): quaternion in world frame  
+                drone_lin_vel_b,    # Linear velocity (3D): body frame
+                drone_ang_vel_b,    # Angular velocity (3D): body frame
+                gate_pos_b,         # Target position (3D): next gate in body frame
+                prev_actions,       # Previous action (4D): motor commands
             ],
             # TODO ----- END -----
             dim=-1,
