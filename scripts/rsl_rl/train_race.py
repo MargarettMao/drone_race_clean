@@ -7,20 +7,27 @@
 
 """Launch Isaac Sim Simulator first."""
 
-import sys
 import os
+import sys
 
+# Fallback to vendored RSL-RL if the package is not installed globally
 local_rsl_path = os.path.abspath("src/third_parties/rsl_rl_local")
-if os.path.exists(local_rsl_path):
+if os.path.exists(local_rsl_path) and local_rsl_path not in sys.path:
     sys.path.insert(0, local_rsl_path)
     print(f"[INFO] Using local rsl_rl from: {local_rsl_path}")
-else:
-    print(f"[WARNING] Local rsl_rl not found at: {local_rsl_path}")
 
-from rsl_rl.utils import wandb_fix
+# Add project root to Python path
+import rootutils
+root = rootutils.setup_root(
+    search_from=__file__,
+    indicator="pyproject.toml",
+    pythonpath=True,
+    cwd=True,
+)
+
 import argparse
 from isaaclab.app import AppLauncher
-import cli_args
+from scripts.rsl_rl import cli_args
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
@@ -107,13 +114,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # TODO ----- START ----- Define rewards scales
     # reward scales
-    progress_goal_reward_scale = 50.0
-    crash_reward = -1.0
-    death_cost = -10.0
+    progress_goal_reward_scale = 50.0  # Reward for making progress toward gates
+    gate_passed_reward_scale = 10.0    # Bonus reward for passing through a gate
+    crash_reward_scale = -1.0          # Penalty for crashing
+    time_reward_scale = -0.01          # Small penalty per timestep to encourage speed
+    death_cost = -10.0                 # Large penalty for dying (going out of bounds, etc.)
 
     rewards = {
         'progress_goal_reward_scale': progress_goal_reward_scale,
-        'crash_reward_scale': crash_reward,
+        'gate_passed_reward_scale': gate_passed_reward_scale,
+        'crash_reward_scale': crash_reward_scale,
+        'time_reward_scale': time_reward_scale,
         'death_cost': death_cost,
     }
     # TODO ----- END -----
